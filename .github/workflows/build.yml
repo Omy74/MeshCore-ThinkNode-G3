@@ -1,0 +1,46 @@
+name: Build G3 repeater
+on:
+  workflow_dispatch:
+    inputs:
+      admin_password:
+        description: Password admin (solo lettere/numeri)
+        required: true
+      advert_name:
+        description: Nome del repeater
+        default: ThinkNode G3 Repeater
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: meshcore-dev/MeshCore
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install platformio
+      - name: Importa variante G3 (PR 3570)
+        run: |
+          git fetch --depth=1 origin pull/3570/head
+          git checkout FETCH_HEAD -- variants/thinknode_g3
+      - name: Imposta password e nome
+        env:
+          PW: ${{ inputs.admin_password }}
+          NAME: ${{ inputs.advert_name }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          p = 'variants/thinknode_g3/platformio.ini'
+          s = open(p).read()
+          s = s.replace("'\"password\"'", "'\"" + os.environ['PW'] + "\"'")
+          s = s.replace("'\"ThinkNode G3 Repeater\"'", "'\"" + os.environ['NAME'] + "\"'")
+          pwr = "  -D LORA_TX_POWER=22\n"
+          assert pwr in s, "LORA_TX_POWER non trovato"
+          s = s.replace(pwr, pwr + "  -D LORA_CR=8\n")
+          open(p, 'w').write(s)
+          EOF
+      - run: pio run -e ThinkNode_G3_repeater
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g3-repeater
+          path: .pio/build/ThinkNode_G3_repeater/*.bin
