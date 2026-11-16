@@ -14,7 +14,7 @@ on:
         options:
           - HIGH
           - LOW
-        default: HIGH
+        default: LOW
 jobs:
   build:
     runs-on: ubuntu-latest
