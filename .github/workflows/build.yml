@@ -9,12 +9,16 @@ on:
         description: Nome del repeater
         default: ThinkNode G3 Repeater
       link_led_level:
-        description: Livello che ACCENDE il LED LINK (prova HIGH; se resta acceso fisso usa LOW)
+        description: Livello che ACCENDE il LED LINK (sul G3 e' LOW)
         type: choice
         options:
-          - HIGH
           - LOW
+          - HIGH
         default: LOW
+      web_ui:
+        description: Includi interfaccia web e Wi-Fi (richiede G3Web.h e G3Web.cpp nel repository)
+        type: boolean
+        default: true
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,6 +26,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: meshcore-dev/MeshCore
+      - uses: actions/checkout@v4
+        with:
+          path: own
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -35,6 +42,7 @@ jobs:
           PW: ${{ inputs.admin_password }}
           NAME: ${{ inputs.advert_name }}
           LEVEL: ${{ inputs.link_led_level }}
+          WEB: ${{ inputs.web_ui }}
         run: |
           python3 - <<'EOF'
           import os
@@ -104,6 +112,24 @@ jobs:
             }
           };
           """)
+
+          # interfaccia web: copia i file e aggancia tre punti in main.cpp
+          if os.environ['WEB'] == 'true':
+              import shutil
+              for f in ('G3Web.h', 'G3Web.cpp'):
+                  shutil.copy('own/' + f, d + f)
+              m = 'examples/simple_repeater/main.cpp'
+              s = open(m).read()
+              a1 = '#include "MyMesh.h"\n'
+              assert s.count(a1) == 1, "include MyMesh.h non trovato"
+              s = s.replace(a1, a1 + '#include "G3Web.h"\nextern MyMesh the_mesh;\nstatic const char* g3web_pw() { return the_mesh.getNodePrefs()->password; }\nstatic void g3web_exec(uint32_t ts, char* cmd, char* reply) { the_mesh.handleCommand(ts, cmd, reply); }\n')
+              a2 = '  the_mesh.begin(fs);\n'
+              assert s.count(a2) == 1, "the_mesh.begin non trovato"
+              s = s.replace(a2, a2 + '  g3web_start(g3web_pw, g3web_exec);\n')
+              a3 = '  the_mesh.loop();\n'
+              assert s.count(a3) == 1, "the_mesh.loop non trovato"
+              s = s.replace(a3, '  g3web_poll();\n' + a3)
+              open(m, 'w').write(s)
           EOF
       - run: pio run -e ThinkNode_G3_repeater
       - uses: actions/upload-artifact@v4
