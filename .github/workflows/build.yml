@@ -86,6 +86,9 @@ jobs:
               wr = "-D WRAPPER_CLASS=CustomSX1262Wrapper"
               assert wr in s, "WRAPPER_CLASS non trovato"
               s = s.replace(wr, "-D WRAPPER_CLASS=ThinkNodeG3Wrapper")
+          else:
+              # Heltec V3: il pulsante di reset e' PRG
+              s = s.replace("  -D LORA_CR=8\n", "  -D LORA_CR=8\n  -D G3WEB_BTN_NAME='\"PRG\"'\n")
           open(p, 'w').write(s)
 
           if BOARD != 'Heltec V3':
