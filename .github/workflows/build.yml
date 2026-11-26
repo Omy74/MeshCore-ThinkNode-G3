@@ -1,15 +1,23 @@
-name: Build G3 repeater
+name: Build repeater
 on:
   workflow_dispatch:
     inputs:
+      board:
+        description: Scheda
+        type: choice
+        options:
+          - ThinkNode G3
+          - Heltec V3
+        default: ThinkNode G3
       admin_password:
         description: Password admin (solo lettere/numeri)
         required: true
       advert_name:
-        description: Nome del repeater
-        default: ThinkNode G3 Repeater
+        description: Nome del repeater (vuoto = nome predefinito della scheda)
+        required: false
+        default: ''
       link_led_level:
-        description: Livello che ACCENDE il LED LINK (sul G3 e' LOW)
+        description: Solo G3 - livello che ACCENDE il LED LINK (sul G3 e' LOW)
         type: choice
         options:
           - LOW
@@ -34,84 +42,104 @@ jobs:
           python-version: "3.11"
       - run: pip install platformio
       - name: Importa variante G3 (PR 3570)
+        if: ${{ inputs.board == 'ThinkNode G3' }}
         run: |
           git fetch --depth=1 origin pull/3570/head
           git checkout FETCH_HEAD -- variants/thinknode_g3
-      - name: Imposta password, nome e LED
+      - name: Imposta password, nome, radio e interfaccia web
         env:
+          BOARD: ${{ inputs.board }}
           PW: ${{ inputs.admin_password }}
           NAME: ${{ inputs.advert_name }}
           LEVEL: ${{ inputs.link_led_level }}
           WEB: ${{ inputs.web_ui }}
         run: |
           python3 - <<'EOF'
-          import os
-          d = 'variants/thinknode_g3/'
+          import os, re
+          BOARD = os.environ['BOARD']
+          PW = os.environ['PW']
+          assert re.fullmatch(r'[A-Za-z0-9]+', PW), "La password deve contenere solo lettere e numeri"
+          if BOARD == 'Heltec V3':
+              d = 'variants/heltec_v3/'
+              pioenv = 'Heltec_v3_repeater'
+              old_name = 'Heltec Repeater'
+          else:
+              d = 'variants/thinknode_g3/'
+              pioenv = 'ThinkNode_G3_repeater'
+              old_name = 'ThinkNode G3 Repeater'
+          NAME = os.environ['NAME'].strip() or old_name
+          assert not any(c in NAME for c in '"\\\'$`'), "Il nome contiene caratteri non ammessi"
 
-          # platformio.ini: password, nome, CR 8, livello LED, wrapper con LED RX
+          # platformio.ini: password, nome, coding rate 8
           p = d + 'platformio.ini'
           s = open(p).read()
-          s = s.replace("'\"password\"'", "'\"" + os.environ['PW'] + "\"'")
-          s = s.replace("'\"ThinkNode G3 Repeater\"'", "'\"" + os.environ['NAME'] + "\"'")
+          assert "'\"password\"'" in s, "password predefinita non trovata"
+          s = s.replace("'\"password\"'", "'\"" + PW + "\"'")
+          assert "'\"" + old_name + "\"'" in s, "nome predefinito non trovato"
+          s = s.replace("'\"" + old_name + "\"'", "'\"" + NAME + "\"'")
           pwr = "  -D LORA_TX_POWER=22\n"
           assert pwr in s, "LORA_TX_POWER non trovato"
-          s = s.replace(pwr, pwr + "  -D LORA_CR=8\n  -D G3_RX_LED_ON=" + os.environ['LEVEL'] + "\n")
-          wr = "-D WRAPPER_CLASS=CustomSX1262Wrapper"
-          assert wr in s, "WRAPPER_CLASS non trovato"
-          s = s.replace(wr, "-D WRAPPER_CLASS=ThinkNodeG3Wrapper")
+          s = s.replace(pwr, pwr + "  -D LORA_CR=8\n")
+          if BOARD != 'Heltec V3':
+              # G3: livello LED e wrapper con LED RX
+              s = s.replace("  -D LORA_CR=8\n", "  -D LORA_CR=8\n  -D G3_RX_LED_ON=" + os.environ['LEVEL'] + "\n")
+              wr = "-D WRAPPER_CLASS=CustomSX1262Wrapper"
+              assert wr in s, "WRAPPER_CLASS non trovato"
+              s = s.replace(wr, "-D WRAPPER_CLASS=ThinkNodeG3Wrapper")
           open(p, 'w').write(s)
 
-          # target.h: includi il nuovo wrapper
-          t = d + 'target.h'
-          s = open(t).read()
-          inc = "#include <helpers/radiolib/CustomSX1262Wrapper.h>\n"
-          assert inc in s, "include wrapper non trovato"
-          s = s.replace(inc, inc + '#include "ThinkNodeG3Wrapper.h"\n')
-          open(t, 'w').write(s)
+          if BOARD != 'Heltec V3':
+              # target.h: includi il nuovo wrapper
+              t = d + 'target.h'
+              s = open(t).read()
+              inc = "#include <helpers/radiolib/CustomSX1262Wrapper.h>\n"
+              assert inc in s, "include wrapper non trovato"
+              s = s.replace(inc, inc + '#include "ThinkNodeG3Wrapper.h"\n')
+              open(t, 'w').write(s)
 
-          # nuovo wrapper: LED LINK (GPIO 5) lampeggia a ogni pacchetto ricevuto
-          open(d + 'ThinkNodeG3Wrapper.h', 'w').write("""#pragma once
+              # nuovo wrapper: LED LINK (GPIO 5) lampeggia a ogni pacchetto ricevuto
+              open(d + 'ThinkNodeG3Wrapper.h', 'w').write("""#pragma once
 
-          #include <helpers/radiolib/CustomSX1262Wrapper.h>
+              #include <helpers/radiolib/CustomSX1262Wrapper.h>
 
-          // LED LINK (GPIO 5): lampeggia quando arriva un pacchetto valido.
-          // Il LED LoRa (GPIO 6) per la trasmissione e' gestito da ThinkNodeG3Board.
-          #ifndef G3_RX_LED_PIN
-          #define G3_RX_LED_PIN 5
-          #endif
-          #ifndef G3_RX_LED_ON
-          #define G3_RX_LED_ON HIGH
-          #endif
-          #define G3_RX_LED_OFF ((G3_RX_LED_ON) == HIGH ? LOW : HIGH)
-          #define G3_RX_LED_MS 80
+              // LED LINK (GPIO 5): lampeggia quando arriva un pacchetto valido.
+              // Il LED LoRa (GPIO 6) per la trasmissione e' gestito da ThinkNodeG3Board.
+              #ifndef G3_RX_LED_PIN
+              #define G3_RX_LED_PIN 5
+              #endif
+              #ifndef G3_RX_LED_ON
+              #define G3_RX_LED_ON HIGH
+              #endif
+              #define G3_RX_LED_OFF ((G3_RX_LED_ON) == HIGH ? LOW : HIGH)
+              #define G3_RX_LED_MS 80
 
-          class ThinkNodeG3Wrapper : public CustomSX1262Wrapper {
-            uint32_t _rx_led_off_at = 0;
-            bool _rx_led_lit = false;
-            bool _rx_led_ready = false;
+              class ThinkNodeG3Wrapper : public CustomSX1262Wrapper {
+                uint32_t _rx_led_off_at = 0;
+                bool _rx_led_lit = false;
+                bool _rx_led_ready = false;
 
-          public:
-            ThinkNodeG3Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : CustomSX1262Wrapper(radio, board) { }
+              public:
+                ThinkNodeG3Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : CustomSX1262Wrapper(radio, board) { }
 
-            int recvRaw(uint8_t* bytes, int sz) override {
-              if (!_rx_led_ready) {
-                pinMode(G3_RX_LED_PIN, OUTPUT);
-                digitalWrite(G3_RX_LED_PIN, G3_RX_LED_OFF);
-                _rx_led_ready = true;
-              }
-              int len = CustomSX1262Wrapper::recvRaw(bytes, sz);
-              if (len > 0) {
-                digitalWrite(G3_RX_LED_PIN, G3_RX_LED_ON);
-                _rx_led_lit = true;
-                _rx_led_off_at = millis() + G3_RX_LED_MS;
-              } else if (_rx_led_lit && (int32_t)(millis() - _rx_led_off_at) >= 0) {
-                digitalWrite(G3_RX_LED_PIN, G3_RX_LED_OFF);
-                _rx_led_lit = false;
-              }
-              return len;
-            }
-          };
-          """)
+                int recvRaw(uint8_t* bytes, int sz) override {
+                  if (!_rx_led_ready) {
+                    pinMode(G3_RX_LED_PIN, OUTPUT);
+                    digitalWrite(G3_RX_LED_PIN, G3_RX_LED_OFF);
+                    _rx_led_ready = true;
+                  }
+                  int len = CustomSX1262Wrapper::recvRaw(bytes, sz);
+                  if (len > 0) {
+                    digitalWrite(G3_RX_LED_PIN, G3_RX_LED_ON);
+                    _rx_led_lit = true;
+                    _rx_led_off_at = millis() + G3_RX_LED_MS;
+                  } else if (_rx_led_lit && (int32_t)(millis() - _rx_led_off_at) >= 0) {
+                    digitalWrite(G3_RX_LED_PIN, G3_RX_LED_OFF);
+                    _rx_led_lit = false;
+                  }
+                  return len;
+                }
+              };
+              """)
 
           # interfaccia web: copia i file e aggancia tre punti in main.cpp
           if os.environ['WEB'] == 'true':
@@ -130,9 +158,11 @@ jobs:
               assert s.count(a3) == 1, "the_mesh.loop non trovato"
               s = s.replace(a3, '  g3web_poll();\n' + a3)
               open(m, 'w').write(s)
+
+          open(os.environ['GITHUB_ENV'], 'a').write('PIOENV=' + pioenv + '\n')
           EOF
-      - run: pio run -e ThinkNode_G3_repeater
+      - run: pio run -e ${{ env.PIOENV }}
       - uses: actions/upload-artifact@v4
         with:
-          name: g3-repeater
-          path: .pio/build/ThinkNode_G3_repeater/*.bin
+          name: ${{ inputs.board == 'Heltec V3' && 'v3-repeater' || 'g3-repeater' }}
+          path: .pio/build/${{ env.PIOENV }}/*.bin
