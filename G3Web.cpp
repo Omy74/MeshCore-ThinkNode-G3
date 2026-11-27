@@ -15,19 +15,14 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <string.h>
+#include <stdlib.h>
 #include "G3Web.h"
 
 #ifdef G3WEB_ETH_PROBE
 #include <SPI.h>
 #include "esp_system.h"
 #include "esp_netif.h"
-#include "lwip/netif.h"
-#include "lwip/tcpip.h"
-#include "lwip/dhcp.h"
-#include "lwip/etharp.h"
-#include "lwip/pbuf.h"
-#include "lwip/ethip6.h"
-#include "netif/ethernet.h"
+#include "esp_event.h"
 // Pin del CH390 ricavati dal firmware originale del G3 (SPI3, modo 0, 10 MHz).
 #ifndef G3ETH_SCLK
 #define G3ETH_SCLK 13
@@ -58,11 +53,11 @@ WebServer web(80);
 // Ethernet via CH390 (compatibile DM9051) su SPI: driver minimo + interfaccia lwIP con DHCP.
 SPIClass ethSPI(FSPI);                    // la radio LoRa usa gia' HSPI (SPI3): qui serve l'altro bus
 SemaphoreHandle_t eth_mtx = nullptr;
-struct netif eth_if;
+esp_netif_t* eth_nif = nullptr;
 uint16_t eth_vid = 0, eth_pid = 0;
 uint8_t eth_rev = 0, eth_nsr = 0, eth_ncr = 0;
 bool eth_ready = false, eth_link = false, eth_dhcp = false, eth_ip_logged = false;
-uint32_t eth_rx = 0, eth_tx = 0, eth_rxerr = 0, eth_txerr = 0, eth_resets = 0;
+uint32_t eth_flaps = 0, eth_rx = 0, eth_tx = 0, eth_rxerr = 0, eth_txerr = 0, eth_resets = 0;
 uint8_t eth_mac[6];
 uint8_t eth_rxbuf[1600];
 
@@ -121,50 +116,40 @@ void ethHwInit() {
   ethWrite(R_RCR, 0x31);                    // RX on, scarta CRC e pacchetti lunghi
 }
 
-err_t ethLowOutput(struct netif*, struct pbuf* p) {
-  if (!eth_ready || !eth_link || p->tot_len > 1514) return ERR_IF;
-  if (xSemaphoreTake(eth_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return ERR_TIMEOUT;
+
+struct EthGlue { esp_netif_driver_base_t base; };
+EthGlue eth_glue;
+
+// Invio di un pacchetto (chiamato da lwIP tramite esp_netif).
+esp_err_t ethTransmit(void*, void* buf, size_t len) {
+  if (!eth_ready || !eth_link || len > 1514 || len < 14) return ESP_FAIL;
+  if (xSemaphoreTake(eth_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return ESP_FAIL;
   uint32_t t0 = millis();
   while (ethRead(R_TCR) & 0x01) {           // attende la fine dell'invio precedente
-    if (millis() - t0 > 20) { eth_txerr++; xSemaphoreGive(eth_mtx); return ERR_TIMEOUT; }
+    if (millis() - t0 > 20) { eth_txerr++; xSemaphoreGive(eth_mtx); return ESP_FAIL; }
   }
-  uint16_t len = p->tot_len;
   ethWrite(R_TXPLL, len & 0xFF);
   ethWrite(R_TXPLH, len >> 8);
   csLow();
   ethSPI.transfer(0x80 | R_MWCMD);
-  for (struct pbuf* q = p; q; q = q->next) ethSPI.writeBytes((const uint8_t*)q->payload, q->len);
+  ethSPI.writeBytes((const uint8_t*)buf, len);
   csHigh();
   ethWrite(R_TCR, 0x01);                    // avvia l'invio
   eth_tx++;
   xSemaphoreGive(eth_mtx);
-  return ERR_OK;
+  return ESP_OK;
 }
 
-err_t ethNetifInit(struct netif* n) {
-  n->name[0] = 'e'; n->name[1] = 't';
-  n->mtu = 1500;
-  n->hwaddr_len = 6;
-  memcpy(n->hwaddr, eth_mac, 6);
-  n->output = etharp_output;
-#if LWIP_IPV6
-  n->output_ip6 = ethip6_output;
-#endif
-  n->linkoutput = ethLowOutput;
-  n->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
-#if LWIP_IGMP
-  n->flags |= NETIF_FLAG_IGMP;
-#endif
-#if LWIP_NETIF_HOSTNAME
-  n->hostname = G3WEB_HOSTNAME;
-#endif
-  return ERR_OK;
-}
+void ethFreeRx(void*, void* buf) { free(buf); }
 
-// Operazioni su lwIP: eseguite nel thread di rete tramite tcpip_callback (stesso ordine di invio).
-enum { OP_ADD = 1, OP_LINK_UP, OP_LINK_DOWN, OP_DEFAULT };
-void ethNetOp(void* a);
-void ethCall(int op) { tcpip_callback(ethNetOp, (void*)(intptr_t)op); }
+esp_err_t ethPostAttach(esp_netif_t* n, esp_netif_iodriver_handle h) {
+  esp_netif_driver_ifconfig_t c;
+  memset(&c, 0, sizeof(c));
+  c.handle = h;
+  c.transmit = ethTransmit;
+  c.driver_free_rx_buffer = ethFreeRx;
+  return esp_netif_set_driver_config(n, &c);
+}
 
 // Legge un pacchetto dalla memoria del chip; true se ne ha consumato uno.
 bool ethRxOne() {
@@ -182,74 +167,62 @@ bool ethRxOne() {
   csHigh();
   if (h[1] & 0xBF) { eth_rxerr++; return true; }      // pacchetto con errori: scartato
   len -= 4;
-  struct pbuf* p = pbuf_alloc(PBUF_RAW, len, PBUF_POOL);
-  if (!p) { eth_rxerr++; return true; }
-  pbuf_take(p, eth_rxbuf, len);
+  void* copy = malloc(len);
+  if (!copy) { eth_rxerr++; return true; }
+  memcpy(copy, eth_rxbuf, len);
   eth_rx++;
-  if (eth_if.input(p, &eth_if) != ERR_OK) pbuf_free(p);
+  esp_netif_receive(eth_nif, copy, len, copy);        // lo stack libera la copia con ethFreeRx
   return true;
 }
 
-void ethNetOp(void* a) {
-  ip4_addr_t z; ip4_addr_set_zero(&z);
-  switch ((intptr_t)a) {
-    case OP_ADD:
-      netif_add(&eth_if, &z, &z, &z, nullptr, ethNetifInit, tcpip_input);
-      netif_set_up(&eth_if);
-      break;
-    case OP_LINK_UP:
-      netif_set_link_up(&eth_if);
-      dhcp_start(&eth_if);
-      break;
-    case OP_LINK_DOWN:
-      dhcp_stop(&eth_if);
-      netif_set_addr(&eth_if, &z, &z, &z);
-      netif_set_link_down(&eth_if);
-      break;
-    case OP_DEFAULT:
-      if (!netif_default) netif_set_default(&eth_if);
-      break;
-  }
+bool ethIp(char* out, size_t n, bool gw = false) {
+  esp_netif_ip_info_t info;
+  out[0] = 0;
+  if (!eth_nif || esp_netif_get_ip_info(eth_nif, &info) != ESP_OK) return false;
+  esp_ip4addr_ntoa(gw ? &info.gw : &info.ip, out, n);
+  return (gw ? info.gw.addr : info.ip.addr) != 0;
 }
 
-bool ethHasIp() { return eth_link && !ip4_addr_isany_val(*netif_ip4_addr(&eth_if)); }
+bool ethHasIp() { char b[16]; return eth_link && ethIp(b, sizeof(b)); }
 
 void ethTask(void*) {
   uint32_t last_link = 0;
   for (;;) {
     uint32_t now = millis();
     if (xSemaphoreTake(eth_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
+      bool changed = false;
       if (now - last_link >= 500) {
         last_link = now;
         eth_nsr = ethRead(R_NSR);
         eth_ncr = ethRead(R_NCR);
         bool l = (eth_nsr & 0x40) != 0;
-        if (l != eth_link) {
-          eth_link = l;
-          xSemaphoreGive(eth_mtx);
-          if (l) {
-            Serial.println("[G3Web] Ethernet: cavo collegato");
-            ethCall(OP_LINK_UP);
-            eth_dhcp = true;
-          } else {
-            Serial.println("[G3Web] Ethernet: cavo scollegato");
-            ethCall(OP_LINK_DOWN);
-            eth_dhcp = false;
-            eth_ip_logged = false;
-          }
-          xSemaphoreTake(eth_mtx, portMAX_DELAY);
-        }
+        static uint8_t down_cnt = 0;
+        if (!l && eth_link && ++down_cnt < 4) l = true;   // il cavo si considera scollegato solo dopo ~2 s
+        if (l) down_cnt = 0;
+        if (l != eth_link) { eth_link = l; eth_flaps++; changed = true; }
       }
-      if (eth_link) {
+      if (eth_link && !changed) {
         int n = 0;
         while (n++ < 8 && ethRxOne()) {}
       }
       xSemaphoreGive(eth_mtx);
+      if (changed) {
+        if (eth_link) {
+          Serial.println("[G3Web] Ethernet: cavo collegato");
+          esp_netif_action_connected(eth_nif, nullptr, 0, nullptr);   // avvia il DHCP
+        } else {
+          Serial.println("[G3Web] Ethernet: cavo scollegato");
+          esp_netif_action_disconnected(eth_nif, nullptr, 0, nullptr);
+          eth_ip_logged = false;
+        }
+      }
     }
-    if (eth_link && !eth_ip_logged && !ip4_addr_isany_val(*netif_ip4_addr(&eth_if))) {
-      eth_ip_logged = true;
-      ethCall(OP_DEFAULT);
-      Serial.printf("[G3Web] Ethernet: http://%s/\n", ip4addr_ntoa(netif_ip4_addr(&eth_if)));
+    if (eth_link && !eth_ip_logged) {
+      char b[16];
+      if (ethIp(b, sizeof(b))) {
+        eth_ip_logged = true;
+        Serial.printf("[G3Web] Ethernet: http://%s/\n", b);
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(eth_link ? 2 : 100));
   }
@@ -270,7 +243,15 @@ void ethStart() {
   Serial.printf("[G3Web] CH390: VID=%04X PID=%04X REV=%02X NSR=%02X\n", eth_vid, eth_pid, eth_rev, eth_nsr);
   if (eth_vid != 0x1C00) return;            // chip assente o non risponde: niente rete cablata
   esp_netif_init();                         // avvia lwIP anche con il Wi-Fi spento
-  ethCall(OP_ADD);
+  esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+  eth_nif = esp_netif_new(&cfg);
+  if (!eth_nif) { Serial.println("[G3Web] Ethernet: esp_netif_new fallito"); return; }
+  eth_glue.base.post_attach = ethPostAttach;
+  eth_glue.base.netif = nullptr;
+  if (esp_netif_attach(eth_nif, &eth_glue) != ESP_OK) { Serial.println("[G3Web] Ethernet: attach fallito"); return; }
+  esp_netif_set_mac(eth_nif, eth_mac);
+  esp_netif_set_hostname(eth_nif, G3WEB_HOSTNAME);
+  esp_netif_action_start(eth_nif, nullptr, 0, nullptr);
   eth_ready = true;
   xTaskCreatePinnedToCore(ethTask, "g3eth", 4096, nullptr, 3, nullptr, 0);
 }
@@ -379,7 +360,7 @@ let WEN=true,REP=true;
 async function rep(){await run('set repeat '+(REP?'off':'on'));refresh()}
 async function wen(){const msgt=WEN?'Disattivare il Wi-Fi? La pagina sarà raggiungibile solo dalla rete cablata. Se non hai la LAN attiva non potrai più aprirla: per riattivare il Wi-Fi tieni premuto il pulsante di reset per 5 secondi.':'Riattivare il Wi-Fi?';if(!confirm(msgt))return;try{const r=await post('/api/wifien','en='+(WEN?0:1));if(r!==null){msg(r);WEN=!WEN;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi'}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
 function ethTxt(e){if(e.vid!==0x1c00)return 'chip non rilevato';if(!e.ready)return 'errore di avvio';
-if(!e.link)return 'cavo scollegato';return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+' - rx '+e.rx+' tx '+e.tx+(e.err?' err '+e.err:'')}
+if(!e.link)return 'cavo scollegato - NSR '+e.nsr.toString(16)+' cambi link '+e.fl+' reset '+e.rs;return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+' - rx '+e.rx+' tx '+e.tx+' err '+e.err+' (tx '+e.txe+') reset '+e.rs+' - NSR '+e.nsr.toString(16)+' cambi link '+e.fl}
 function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' g ':'')+h+' h '+m+' min'}
 const HMAX=360,HI={t:[],noise:[],rssi:[],snr:[],rx:[],tx:[]};let prevC=null;
 function hpush(k,v){const a=HI[k];a.push(v);if(a.length>HMAX)a.shift()}
@@ -543,11 +524,16 @@ void handleStatus() {
   o += ",\"link\":"; o += eth_link ? "true" : "false";
   o += ",\"spd\":"; o += (eth_nsr & 0x80) ? 10 : 100;
   o += ",\"fdx\":"; o += (eth_ncr & 0x08) ? "true" : "false";
-  o += ",\"ip\":"; jesc(o, eth_ready ? ip4addr_ntoa(netif_ip4_addr(&eth_if)) : "");
-  o += ",\"gw\":"; jesc(o, eth_ready ? ip4addr_ntoa(netif_ip4_gw(&eth_if)) : "");
+  char eb[16];
+  ethIp(eb, sizeof(eb)); o += ",\"ip\":"; jesc(o, eb);
+  ethIp(eb, sizeof(eb), true); o += ",\"gw\":"; jesc(o, eb);
   o += ",\"rx\":"; o += eth_rx;
   o += ",\"tx\":"; o += eth_tx;
   o += ",\"err\":"; o += (uint32_t)(eth_rxerr + eth_txerr);
+  o += ",\"nsr\":"; o += (uint32_t)eth_nsr;
+  o += ",\"fl\":"; o += eth_flaps;
+  o += ",\"rs\":"; o += eth_resets;
+  o += ",\"txe\":"; o += eth_txerr;
   o += "},";
 #endif
   o += "\"apname\":"; jesc(o, G3WEB_AP_NAME); o += ",\"btn\":"; jesc(o, G3WEB_BTN_NAME); o += ',';
