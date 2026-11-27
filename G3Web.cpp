@@ -19,6 +19,16 @@
 
 #ifdef G3WEB_ETH_PROBE
 #include <SPI.h>
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "lwip/netif.h"
+#include "lwip/netifapi.h"
+#include "lwip/tcpip.h"
+#include "lwip/dhcp.h"
+#include "lwip/etharp.h"
+#include "lwip/pbuf.h"
+#include "lwip/ethip6.h"
+#include "netif/ethernet.h"
 // Pin del CH390 ricavati dal firmware originale del G3 (SPI3, modo 0, 10 MHz).
 #ifndef G3ETH_SCLK
 #define G3ETH_SCLK 13
@@ -46,49 +56,203 @@ namespace {
 
 WebServer web(80);
 #ifdef G3WEB_ETH_PROBE
-// Prova del chip Ethernet CH390: legge identificativo e stato del cavo (nessuna rete, solo diagnostica).
+// Ethernet via CH390 (compatibile DM9051) su SPI: driver minimo + interfaccia lwIP con DHCP.
 SPIClass ethSPI(FSPI);                    // la radio LoRa usa gia' HSPI (SPI3): qui serve l'altro bus
+SemaphoreHandle_t eth_mtx = nullptr;
+struct netif eth_if;
 uint16_t eth_vid = 0, eth_pid = 0;
-uint8_t eth_rev = 0, eth_nsr = 0;
-bool eth_ready = false;
+uint8_t eth_rev = 0, eth_nsr = 0, eth_ncr = 0;
+bool eth_ready = false, eth_link = false, eth_dhcp = false, eth_ip_logged = false;
+uint32_t eth_rx = 0, eth_tx = 0, eth_rxerr = 0, eth_txerr = 0, eth_resets = 0;
+uint8_t eth_mac[6];
+uint8_t eth_rxbuf[1600];
+
+enum { R_NCR = 0x00, R_NSR = 0x01, R_TCR = 0x02, R_RCR = 0x05, R_BPTR = 0x08, R_FCTR = 0x09, R_FCR = 0x0A,
+       R_WCR = 0x0F, R_PAR = 0x10, R_MAR = 0x16, R_GPCR = 0x1E, R_GPR = 0x1F, R_TXPLL = 0x7C, R_TXPLH = 0x7D,
+       R_MRCMDX = 0x70, R_MRCMD = 0x72, R_MWCMD = 0x78, R_MPCR = 0x55, R_ISR = 0xFE, R_IMR = 0xFF };
+
+inline void csLow()  { ethSPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0)); digitalWrite(G3ETH_CS, LOW); }
+inline void csHigh() { digitalWrite(G3ETH_CS, HIGH); ethSPI.endTransaction(); }
 
 uint8_t ethRead(uint8_t reg) {
-  ethSPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(G3ETH_CS, LOW);
+  csLow();
   ethSPI.transfer(reg & 0x7F);              // bit 7 = 0: lettura
   uint8_t v = ethSPI.transfer(0);
-  digitalWrite(G3ETH_CS, HIGH);
-  ethSPI.endTransaction();
+  csHigh();
   return v;
 }
 
 void ethWrite(uint8_t reg, uint8_t v) {
-  ethSPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(G3ETH_CS, LOW);
+  csLow();
   ethSPI.transfer(0x80 | reg);              // bit 7 = 1: scrittura
   ethSPI.transfer(v);
-  digitalWrite(G3ETH_CS, HIGH);
-  ethSPI.endTransaction();
+  csHigh();
 }
 
-void ethProbeInit() {
+void ethRxReset() {                         // ripristino del motore di ricezione dopo un errore
+  ethWrite(R_RCR, 0x00);
+  ethWrite(R_MPCR, 0x02);                   // svuota la FIFO
+  ethWrite(R_MPCR, 0x01);                   // reset puntatori
+  delay(2);
+  ethWrite(R_ISR, 0x3F);
+  ethWrite(R_RCR, 0x31);                    // RX on, scarta CRC e pacchetti lunghi
+  eth_resets++;
+}
+
+void ethHwInit() {
+  ethWrite(R_GPCR, 0x01);
+  ethWrite(R_GPR, 0x00);                    // accende il PHY interno
+  delay(20);
+  ethWrite(R_NCR, 0x01);                    // reset del MAC
+  delay(5);
+  ethWrite(R_NCR, 0x00);
+  ethWrite(R_GPR, 0x00);
+  delay(50);
+  ethWrite(R_NCR, 0x00);
+  ethWrite(R_TCR, 0x00);
+  ethWrite(R_BPTR, 0x3F);
+  ethWrite(R_FCTR, 0x38);
+  ethWrite(R_FCR, 0x00);
+  ethWrite(R_WCR, 0x00);
+  for (int i = 0; i < 6; i++) ethWrite(R_PAR + i, eth_mac[i]);
+  for (int i = 0; i < 8; i++) ethWrite(R_MAR + i, 0xFF);   // accetta broadcast e multicast
+  ethWrite(R_NSR, 0x2C);                    // azzera i flag di stato
+  ethWrite(R_ISR, 0x3F);
+  ethWrite(R_IMR, 0x80);                    // puntatore memoria circolare (niente interrupt: si legge a polling)
+  ethWrite(R_RCR, 0x31);                    // RX on, scarta CRC e pacchetti lunghi
+}
+
+err_t ethLowOutput(struct netif*, struct pbuf* p) {
+  if (!eth_ready || !eth_link || p->tot_len > 1514) return ERR_IF;
+  if (xSemaphoreTake(eth_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return ERR_TIMEOUT;
+  uint32_t t0 = millis();
+  while (ethRead(R_TCR) & 0x01) {           // attende la fine dell'invio precedente
+    if (millis() - t0 > 20) { eth_txerr++; xSemaphoreGive(eth_mtx); return ERR_TIMEOUT; }
+  }
+  uint16_t len = p->tot_len;
+  ethWrite(R_TXPLL, len & 0xFF);
+  ethWrite(R_TXPLH, len >> 8);
+  csLow();
+  ethSPI.transfer(0x80 | R_MWCMD);
+  for (struct pbuf* q = p; q; q = q->next) ethSPI.writeBytes((const uint8_t*)q->payload, q->len);
+  csHigh();
+  ethWrite(R_TCR, 0x01);                    // avvia l'invio
+  eth_tx++;
+  xSemaphoreGive(eth_mtx);
+  return ERR_OK;
+}
+
+err_t ethNetifInit(struct netif* n) {
+  n->name[0] = 'e'; n->name[1] = 't';
+  n->mtu = 1500;
+  n->hwaddr_len = 6;
+  memcpy(n->hwaddr, eth_mac, 6);
+  n->output = etharp_output;
+#if LWIP_IPV6
+  n->output_ip6 = ethip6_output;
+#endif
+  n->linkoutput = ethLowOutput;
+  n->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
+#if LWIP_IGMP
+  n->flags |= NETIF_FLAG_IGMP;
+#endif
+#if LWIP_NETIF_HOSTNAME
+  n->hostname = G3WEB_HOSTNAME;
+#endif
+  return ERR_OK;
+}
+
+// Legge un pacchetto dalla memoria del chip; true se ne ha consumato uno.
+bool ethRxOne() {
+  ethRead(R_MRCMDX);                        // lettura a vuoto: aggiorna lo stato di pronto
+  uint8_t rdy = ethRead(R_MRCMDX);
+  if (rdy == 0) return false;
+  if (rdy != 1) { eth_rxerr++; ethRxReset(); return false; }
+  uint8_t h[4];
+  csLow();
+  ethSPI.transfer(R_MRCMD);
+  ethSPI.transferBytes(nullptr, h, 4);
+  uint16_t len = h[2] | (h[3] << 8);        // comprende i 4 byte di CRC
+  if (len < 18 || len > sizeof(eth_rxbuf)) { csHigh(); eth_rxerr++; ethRxReset(); return false; }
+  ethSPI.transferBytes(nullptr, eth_rxbuf, len);
+  csHigh();
+  if (h[1] & 0xBF) { eth_rxerr++; return true; }      // pacchetto con errori: scartato
+  len -= 4;
+  struct pbuf* p = pbuf_alloc(PBUF_RAW, len, PBUF_POOL);
+  if (!p) { eth_rxerr++; return true; }
+  pbuf_take(p, eth_rxbuf, len);
+  eth_rx++;
+  if (eth_if.input(p, &eth_if) != ERR_OK) pbuf_free(p);
+  return true;
+}
+
+bool ethHasIp() { return eth_link && !ip4_addr_isany_val(*netif_ip4_addr(&eth_if)); }
+
+void ethTask(void*) {
+  uint32_t last_link = 0;
+  for (;;) {
+    uint32_t now = millis();
+    if (xSemaphoreTake(eth_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
+      if (now - last_link >= 500) {
+        last_link = now;
+        eth_nsr = ethRead(R_NSR);
+        eth_ncr = ethRead(R_NCR);
+        bool l = (eth_nsr & 0x40) != 0;
+        if (l != eth_link) {
+          eth_link = l;
+          xSemaphoreGive(eth_mtx);
+          if (l) {
+            Serial.println("[G3Web] Ethernet: cavo collegato");
+            netifapi_netif_set_link_up(&eth_if);
+            netifapi_dhcp_start(&eth_if);
+            eth_dhcp = true;
+          } else {
+            Serial.println("[G3Web] Ethernet: cavo scollegato");
+            netifapi_dhcp_stop(&eth_if);
+            eth_dhcp = false;
+            ip4_addr_t z; ip4_addr_set_zero(&z);
+            netifapi_netif_set_addr(&eth_if, &z, &z, &z);
+            netifapi_netif_set_link_down(&eth_if);
+            eth_ip_logged = false;
+          }
+          xSemaphoreTake(eth_mtx, portMAX_DELAY);
+        }
+      }
+      if (eth_link) {
+        int n = 0;
+        while (n++ < 8 && ethRxOne()) {}
+      }
+      xSemaphoreGive(eth_mtx);
+    }
+    if (eth_link && !eth_ip_logged && !ip4_addr_isany_val(*netif_ip4_addr(&eth_if))) {
+      eth_ip_logged = true;
+      if (!netif_default) netifapi_netif_set_default(&eth_if);
+      Serial.printf("[G3Web] Ethernet: http://%s/\n", ip4addr_ntoa(netif_ip4_addr(&eth_if)));
+    }
+    vTaskDelay(pdMS_TO_TICKS(eth_link ? 2 : 100));
+  }
+}
+
+void ethStart() {
   pinMode(G3ETH_CS, OUTPUT);
   digitalWrite(G3ETH_CS, HIGH);
   pinMode(G3ETH_INT, INPUT);
   ethSPI.begin(G3ETH_SCLK, G3ETH_MISO, G3ETH_MOSI, -1);
-  ethWrite(0x1E, 0x01);                     // GPCR
-  ethWrite(0x1F, 0x00);                     // GPR: accende il PHY interno
-  delay(20);
-  ethWrite(0x00, 0x01);                     // NCR: reset del MAC
-  delay(5);
-  ethWrite(0x1F, 0x00);
-  delay(50);
+  eth_mtx = xSemaphoreCreateMutex();
+  esp_read_mac(eth_mac, ESP_MAC_ETH);
+  ethHwInit();
   eth_vid = ethRead(0x28) | (ethRead(0x29) << 8);
   eth_pid = ethRead(0x2A) | (ethRead(0x2B) << 8);
   eth_rev = ethRead(0x2C);
-  eth_nsr = ethRead(0x01);
-  eth_ready = true;
+  eth_nsr = ethRead(R_NSR);
   Serial.printf("[G3Web] CH390: VID=%04X PID=%04X REV=%02X NSR=%02X\n", eth_vid, eth_pid, eth_rev, eth_nsr);
+  if (eth_vid != 0x1C00) return;            // chip assente o non risponde: niente rete cablata
+  esp_netif_init();                         // avvia lwIP anche con il Wi-Fi spento
+  ip4_addr_t z; ip4_addr_set_zero(&z);
+  netifapi_netif_add(&eth_if, &z, &z, &z, nullptr, ethNetifInit, tcpip_input);
+  netifapi_netif_set_up(&eth_if);
+  eth_ready = true;
+  xTaskCreatePinnedToCore(ethTask, "g3eth", 4096, nullptr, 3, nullptr, 0);
 }
 #endif
 
@@ -194,9 +358,8 @@ async function wf(){const s=$('f_ssid').value.trim(),p=$('f_wpw').value;if(!s)re
 let WEN=true,REP=true;
 async function rep(){await run('set repeat '+(REP?'off':'on'));refresh()}
 async function wen(){const msgt=WEN?'Disattivare il Wi-Fi? La pagina sarà raggiungibile solo dalla rete cablata. Se non hai la LAN attiva non potrai più aprirla: per riattivare il Wi-Fi tieni premuto il pulsante di reset per 5 secondi.':'Riattivare il Wi-Fi?';if(!confirm(msgt))return;try{const r=await post('/api/wifien','en='+(WEN?0:1));if(r!==null){msg(r);WEN=!WEN;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi'}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
-function hx(v,n){return v.toString(16).toUpperCase().padStart(n,'0')}
-function ethTxt(e){if(e.vid===0||e.vid===0xffff)return 'nessuna risposta dal chip (ID '+hx(e.vid,4)+':'+hx(e.pid,4)+', NSR '+hx(e.nsr,2)+')';
-const l=(e.nsr&0x40)?('cavo collegato, '+((e.nsr&0x80)?'10':'100')+' Mbps'):'cavo scollegato';return 'CH390 ID '+hx(e.vid,4)+':'+hx(e.pid,4)+' rev '+hx(e.rev,2)+' - '+l+' (NSR '+hx(e.nsr,2)+')'}
+function ethTxt(e){if(e.vid!==0x1c00)return 'chip non rilevato';if(!e.ready)return 'errore di avvio';
+if(!e.link)return 'cavo scollegato';return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+' - rx '+e.rx+' tx '+e.tx+(e.err?' err '+e.err:'')}
 function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' g ':'')+h+' h '+m+' min'}
 const HMAX=360,HI={t:[],noise:[],rssi:[],snr:[],rx:[],tx:[]};let prevC=null;
 function hpush(k,v){const a=HI[k];a.push(v);if(a.length>HMAX)a.shift()}
@@ -238,7 +401,7 @@ function charts(){chart('ch1',[{n:'Rumore di fondo',k:'noise',c:'#4da3ff'},{n:'U
 let first=true;
 async function refresh(){try{const r=await fetch('/api/status');if(r.status==401){location.reload();return}const s=await r.json(),w=s.wifi;
 const rows=[['Nome',s.name],['Versione',s.ver],['Orologio (UTC)',s.clock],['Radio',s.radio],['Potenza TX',s.tx],['Ripetizione',s.rep==='off'?'disattivata':'attiva'],['Hash percorso',isNaN(+s.hm)||s.hm===''?'?':(+s.hm+1)+' byte'],['Posizione',s.lat+', '+s.lon],['Wi-Fi',s.wen===false?'disattivato':w.ssid?(w.ssid+' - '+w.ip+' - '+w.rssi+' dBm'):(w.ap?'modalità setup (rete '+s.apname+')':'non connesso')],['Memoria libera',Math.round(s.heap/1024)+' kB'],['Attivo da',fmt(s.up)]];
-if(s.eth)rows.push(['Ethernet (prova)',ethTxt(s.eth)]);
+if(s.eth)rows.push(['Ethernet',ethTxt(s.eth)]);
 const t=$('t');t.textContent='';rows.forEach(a=>{const tr=document.createElement('tr');a.forEach(x=>{const td=document.createElement('td');td.textContent=x;tr.appendChild(td)});t.appendChild(tr)});
 $('core').textContent=s.core;$('rs').textContent=s.rs;$('pk').textContent=s.pk;$('nb').textContent=s.nb||'(nessuno)';
 REP=s.rep!=='off';$('b_rep').textContent=REP?'Disattiva ripetizione':'Attiva ripetizione';WEN=s.wen!==false;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi';$('hd').textContent=s.name+' \u00b7 MeshCore Repeater';document.title=s.name;$('rst').textContent='Se cambi rete o sbagli, tieni premuto il pulsante '+s.btn+' per 5 secondi: il nodo cancella il Wi-Fi e crea la rete "'+s.apname+'" (pagina su 192.168.4.1). Se la rete salvata non risponde per 45 secondi, la crea da solo.';
@@ -356,9 +519,15 @@ void handleStatus() {
   o += wifi_on ? "\"wen\":true," : "\"wen\":false,";
 #ifdef G3WEB_ETH_PROBE
   o += "\"eth\":{\"vid\":"; o += (uint32_t)eth_vid;
-  o += ",\"pid\":"; o += (uint32_t)eth_pid;
-  o += ",\"rev\":"; o += (uint32_t)eth_rev;
-  o += ",\"nsr\":"; o += (uint32_t)eth_nsr;
+  o += ",\"ready\":"; o += eth_ready ? "true" : "false";
+  o += ",\"link\":"; o += eth_link ? "true" : "false";
+  o += ",\"spd\":"; o += (eth_nsr & 0x80) ? 10 : 100;
+  o += ",\"fdx\":"; o += (eth_ncr & 0x08) ? "true" : "false";
+  o += ",\"ip\":"; jesc(o, eth_ready ? ip4addr_ntoa(netif_ip4_addr(&eth_if)) : "");
+  o += ",\"gw\":"; jesc(o, eth_ready ? ip4addr_ntoa(netif_ip4_gw(&eth_if)) : "");
+  o += ",\"rx\":"; o += eth_rx;
+  o += ",\"tx\":"; o += eth_tx;
+  o += ",\"err\":"; o += (uint32_t)(eth_rxerr + eth_txerr);
   o += "},";
 #endif
   o += "\"apname\":"; jesc(o, G3WEB_AP_NAME); o += ",\"btn\":"; jesc(o, G3WEB_BTN_NAME); o += ',';
@@ -522,7 +691,7 @@ void g3web_start(G3WebPasswordFn password, G3WebExecFn exec) {
   web.collectHeaders(keys, 1);
   web.begin();
 #ifdef G3WEB_ETH_PROBE
-  ethProbeInit();
+  ethStart();
 #endif
 }
 
@@ -549,9 +718,6 @@ void g3web_poll() {
   }
   if (now - last_check < 2000) return;
   last_check = now;
-#ifdef G3WEB_ETH_PROBE
-  if (eth_ready) eth_nsr = ethRead(0x01);
-#endif
   if (!wifi_on) return;                // Wi-Fi spento: niente controlli di rete
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -574,7 +740,11 @@ void g3web_poll() {
       WiFi.disconnect(false);
       WiFi.begin(saved_ssid, saved_pwd);
     }
-    if (sta_cfg && !ap_on && now - last_ok > 45000) {
+    if (sta_cfg && !ap_on && now - last_ok > 45000
+#ifdef G3WEB_ETH_PROBE
+        && !ethHasIp()                  // con la rete cablata attiva non serve il Wi-Fi di setup
+#endif
+        ) {
       WiFi.mode(WIFI_AP_STA);          // rete irraggiungibile: riapri il setup, continua a riprovare
       WiFi.softAP(G3WEB_AP_NAME);
       ap_on = true;
