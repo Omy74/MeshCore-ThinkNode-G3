@@ -197,8 +197,8 @@ void ethTask(void*) {
         eth_ncr = ethRead(R_NCR);
         bool l = (eth_nsr & 0x40) != 0;
         static uint8_t down_cnt = 0;
-        if (!l && eth_link && ++down_cnt < 4) l = true;   // il cavo si considera scollegato solo dopo ~2 s
         if (l) down_cnt = 0;
+        else if (eth_link && ++down_cnt < 4) l = true;    // il cavo si considera scollegato solo dopo ~2 s
         if (l != eth_link) { eth_link = l; eth_flaps++; changed = true; }
       }
       if (eth_link && !changed) {
