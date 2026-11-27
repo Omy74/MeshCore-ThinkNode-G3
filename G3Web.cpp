@@ -265,7 +265,9 @@ G3WebExecFn execCmd = nullptr;
 char saved_ssid[33] = "";
 char saved_pwd[65] = "";
 bool sta_cfg = false;
-bool wifi_on = true;
+bool wifi_on = true;               // stato reale del Wi-Fi
+uint8_t wifi_mode = 1;             // scelta dell'utente: 0 sempre spento, 1 sempre acceso, 2 automatico (spento col cavo)
+uint32_t auto_since = 0;           // da quando dura la condizione attuale (cavo con IP / cavo assente)
 int8_t wifi_pending = -1;           // -1 nessuna richiesta, 0 spegni, 1 accendi
 uint32_t wifi_pending_at = 0;
 bool ap_on = false;
@@ -329,7 +331,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#0f141b;padding:8px;bor
 </section>
 <section><h2>Wi-Fi</h2>
 <p id="rst" style="margin:0 0 8px;font-size:13px;color:#9fb3c8"></p>
-<div class="r"><button class="s" id="b_wen" onclick="wen()">Disattiva Wi-Fi</button></div>
+<div class="r"><select id="f_wm" onchange="wm()"><option value="1">Wi-Fi sempre acceso</option><option value="0">Wi-Fi sempre spento</option><option value="2" id="o_auto">Automatico: spento se c'è il cavo di rete</option></select></div>
 <div class="r"><input id="f_ssid" placeholder="Nome rete (SSID)"><input id="f_wpw" type="password" placeholder="Password Wi-Fi"><button onclick="wf()">Salva e riavvia</button></div>
 </section>
 <section><h2>Console</h2>
@@ -356,9 +358,9 @@ function pre(){const k=+$('f_preset').value;if(k<0)return;const x=PRE[k];setRadi
 async function rad(){const f=parseFloat($('f_freq').value);if(!(f>=150&&f<=2500))return msg('Frequenza non valida',1);await run('set path.hash.mode '+$('f_hm').value);run('set radio '+f+','+$('f_bw').value+','+$('f_sf').value+','+$('f_cr').value,' - riavvia per applicare')}
 function go(){const v=$('f_cmd').value.trim();if(v)run(v)}
 async function wf(){const s=$('f_ssid').value.trim(),p=$('f_wpw').value;if(!s)return msg('SSID vuoto',1);if(p&&p.length<8)return msg('La password Wi-Fi deve avere almeno 8 caratteri',1);if(!confirm('Salvare il Wi-Fi e riavviare?'))return;try{const r=await post('/api/wifi','ssid='+encodeURIComponent(s)+'&pwd='+encodeURIComponent(p));if(r!==null)msg(r)}catch(e){msg('Riavvio in corso')}}
-let WEN=true,REP=true;
+let WM=1,REP=true,ETHOK=false;
 async function rep(){await run('set repeat '+(REP?'off':'on'));refresh()}
-async function wen(){const msgt=WEN?'Disattivare il Wi-Fi? La pagina sarà raggiungibile solo dalla rete cablata. Se non hai la LAN attiva non potrai più aprirla: per riattivare il Wi-Fi tieni premuto il pulsante di reset per 5 secondi.':'Riattivare il Wi-Fi?';if(!confirm(msgt))return;try{const r=await post('/api/wifien','en='+(WEN?0:1));if(r!==null){msg(r);WEN=!WEN;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi'}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
+async function wm(){const v=+$('f_wm').value;if(v===0&&!ETHOK&&!confirm('Il cavo di rete non risulta collegato con un indirizzo IP: spegnendo il Wi-Fi non potrai più aprire questa pagina. Per riattivarlo tieni premuto il pulsante di reset per 5 secondi. Continuare?')){$('f_wm').value=WM;return}if(v===0&&ETHOK&&!confirm('Spegnere il Wi-Fi? La pagina resterà raggiungibile dal cavo di rete.')){$('f_wm').value=WM;return}try{const r=await post('/api/wifimode','m='+v);if(r!==null){msg(r);WM=v}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
 function ethTxt(e){if(e.vid!==0x1c00)return 'chip non rilevato';if(!e.ready)return 'errore di avvio';
 if(!e.link)return 'cavo scollegato - NSR '+e.nsr.toString(16)+' cambi link '+e.fl+' reset '+e.rs;return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+' - rx '+e.rx+' tx '+e.tx+' err '+e.err+' (tx '+e.txe+') reset '+e.rs+' - NSR '+e.nsr.toString(16)+' cambi link '+e.fl}
 function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' g ':'')+h+' h '+m+' min'}
@@ -401,11 +403,11 @@ hpush('t',now);hpush('noise',Rr.noise_floor==null?null:Rr.noise_floor);hpush('rs
 function charts(){chart('ch1',[{n:'Rumore di fondo',k:'noise',c:'#4da3ff'},{n:'Ultimo RSSI',k:'rssi',c:'#f6ad55',dash:1}],{u:' dBm',dec:0});chart('ch2',[{n:'SNR',k:'snr',c:'#68d391'}],{u:' dB',dec:1});chart('ch3',[{n:'Ricevuti',k:'rx',c:'#4da3ff'},{n:'Inviati',k:'tx',c:'#f6ad55',dash:1}],{u:'/min',dec:1,zero:1})}
 let first=true;
 async function refresh(){try{const r=await fetch('/api/status');if(r.status==401){location.reload();return}const s=await r.json(),w=s.wifi;
-const rows=[['Nome',s.name],['Versione',s.ver],['Orologio (UTC)',s.clock],['Radio',s.radio],['Potenza TX',s.tx],['Ripetizione',s.rep==='off'?'disattivata':'attiva'],['Hash percorso',isNaN(+s.hm)||s.hm===''?'?':(+s.hm+1)+' byte'],['Posizione',s.lat+', '+s.lon],['Wi-Fi',s.wen===false?'disattivato':w.ssid?(w.ssid+' - '+w.ip+' - '+w.rssi+' dBm'):(w.ap?'modalità setup (rete '+s.apname+')':'non connesso')],['Memoria libera',Math.round(s.heap/1024)+' kB'],['Attivo da',fmt(s.up)]];
+const rows=[['Nome',s.name],['Versione',s.ver],['Orologio (UTC)',s.clock],['Radio',s.radio],['Potenza TX',s.tx],['Ripetizione',s.rep==='off'?'disattivata':'attiva'],['Hash percorso',isNaN(+s.hm)||s.hm===''?'?':(+s.hm+1)+' byte'],['Posizione',s.lat+', '+s.lon],['Wi-Fi',s.wen===false?(s.wm===2?'spento automaticamente (cavo di rete attivo)':'disattivato'):w.ssid?(w.ssid+' - '+w.ip+' - '+w.rssi+' dBm'):(w.ap?'modalità setup (rete '+s.apname+')':'non connesso')],['Memoria libera',Math.round(s.heap/1024)+' kB'],['Attivo da',fmt(s.up)]];
 if(s.eth)rows.push(['Ethernet',ethTxt(s.eth)]);
 const t=$('t');t.textContent='';rows.forEach(a=>{const tr=document.createElement('tr');a.forEach(x=>{const td=document.createElement('td');td.textContent=x;tr.appendChild(td)});t.appendChild(tr)});
 $('core').textContent=s.core;$('rs').textContent=s.rs;$('pk').textContent=s.pk;$('nb').textContent=s.nb||'(nessuno)';
-REP=s.rep!=='off';$('b_rep').textContent=REP?'Disattiva ripetizione':'Attiva ripetizione';WEN=s.wen!==false;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi';$('hd').textContent=s.name+' \u00b7 MeshCore Repeater';document.title=s.name;$('rst').textContent='Se cambi rete o sbagli, tieni premuto il pulsante '+s.btn+' per 5 secondi: il nodo cancella il Wi-Fi e crea la rete "'+s.apname+'" (pagina su 192.168.4.1). Se la rete salvata non risponde per 45 secondi, la crea da solo.';
+REP=s.rep!=='off';$('b_rep').textContent=REP?'Disattiva ripetizione':'Attiva ripetizione';WM=s.wm;ETHOK=!!(s.eth&&s.eth.link&&s.eth.ip&&s.eth.ip!=='0.0.0.0');if(document.activeElement!==$('f_wm'))$('f_wm').value=s.wm;if(!s.eth){const o=$('o_auto');if(o)o.remove()}$('hd').textContent=s.name+' \u00b7 MeshCore Repeater';document.title=s.name;$('rst').textContent='Se cambi rete o sbagli, tieni premuto il pulsante '+s.btn+' per 5 secondi: il nodo cancella il Wi-Fi e crea la rete "'+s.apname+'" (pagina su 192.168.4.1). Se la rete salvata non risponde per 45 secondi, la crea da solo.';
 const C=jp(s.core),Rr=jp(s.rs),P=jp(s.pk);cards(C,Rr,P,s.up);sample(Rr,P);charts();
 if(first){first=false;$('f_name').value=s.name;{const q=s.radio.split(',');if(q.length==4)setRadio(+q[0],+q[1],+q[2],+q[3]);if(s.hm!==''&&!isNaN(+s.hm))$('f_hm').value=+s.hm}$('f_tx').value=s.tx;$('f_lat').value=s.lat;$('f_lon').value=s.lon;$('f_ssid').value=w.cfg||''}
 }catch(e){}}
@@ -518,6 +520,7 @@ void handleStatus() {
   field(o, "hm", "get path.hash.mode", 1);
   field(o, "rep", "get repeat", 1);
   o += wifi_on ? "\"wen\":true," : "\"wen\":false,";
+  o += "\"wm\":"; o += (uint32_t)wifi_mode; o += ',';
 #ifdef G3WEB_ETH_PROBE
   o += "\"eth\":{\"vid\":"; o += (uint32_t)eth_vid;
   o += ",\"ready\":"; o += eth_ready ? "true" : "false";
@@ -618,22 +621,33 @@ void applyWifi(bool on) {
   }
 }
 
-void handleWifiEn() {
+void handleWifiMode() {
   if (!authed() || !csrfOk()) return;
-  String v = web.arg("en");
-  if (v.length() != 1 || (v[0] != '0' && v[0] != '1')) { web.send(400, "text/plain", "Valore non valido"); return; }
+  String v = web.arg("m");
+  if (v.length() != 1 || v[0] < '0' || v[0] > '2') { web.send(400, "text/plain", "Valore non valido"); return; }
+#ifndef G3WEB_ETH_PROBE
+  if (v[0] == '2') { web.send(400, "text/plain", "Modo automatico non disponibile: questa scheda non ha la rete cablata"); return; }
+#endif
+  wifi_mode = v[0] - '0';
   g3prefs.begin("g3web", false);
-  g3prefs.putUChar("wen", v[0] == '1' ? 1 : 0);
+  g3prefs.putUChar("wmode", wifi_mode);
   g3prefs.end();
-  sendReply(v[0] == '1' ? "Wi-Fi in accensione..." : "Wi-Fi in spegnimento: questa pagina smettera' di rispondere se la stai usando dal Wi-Fi");
-  wifi_pending = (v[0] == '1') ? 1 : 0;
-  wifi_pending_at = millis() + 400;   // lascia il tempo di inviare la risposta
+  auto_since = 0;
+  if (wifi_mode == 0) {
+    sendReply("Wi-Fi in spegnimento: questa pagina smettera' di rispondere se la stai usando dal Wi-Fi");
+    wifi_pending = 0; wifi_pending_at = millis() + 400;
+  } else if (wifi_mode == 1) {
+    sendReply("Wi-Fi sempre acceso");
+    if (!wifi_on) { wifi_pending = 1; wifi_pending_at = millis() + 400; }
+  } else {
+    sendReply("Modo automatico: il Wi-Fi si spegne ~10 secondi dopo che il cavo ottiene un indirizzo, e si riaccende se scolleghi il cavo");
+  }
 }
 void resetWifi() {
   g3prefs.begin("g3web", false);
   g3prefs.remove("ssid");
   g3prefs.remove("pwd");
-  g3prefs.putUChar("wen", 1);          // il reset riattiva anche il Wi-Fi
+  g3prefs.putUChar("wmode", 1);        // il reset riattiva anche il Wi-Fi
   g3prefs.end();
   Serial.println("[G3Web] Wi-Fi cancellato: riavvio in modalita' setup");
 #ifdef P_LORA_TX_LED                    // LED LoRa del G3 (attivo basso): 3 lampi di conferma
@@ -661,7 +675,9 @@ void g3web_start(G3WebPasswordFn password, G3WebExecFn exec) {
   g3prefs.begin("g3web", false);
   String s = g3prefs.getString("ssid", "");
   String p = g3prefs.getString("pwd", "");
-  wifi_on = g3prefs.getUChar("wen", 1) != 0;
+  wifi_mode = g3prefs.getUChar("wmode", g3prefs.getUChar("wen", 1) ? 1 : 0);
+  if (wifi_mode > 2) wifi_mode = 1;
+  wifi_on = wifi_mode != 0;
   g3prefs.end();
   strncpy(saved_ssid, s.c_str(), sizeof(saved_ssid) - 1);
   strncpy(saved_pwd, p.c_str(), sizeof(saved_pwd) - 1);
@@ -691,7 +707,7 @@ void g3web_start(G3WebPasswordFn password, G3WebExecFn exec) {
   web.on("/api/status", HTTP_GET, handleStatus);
   web.on("/api/cmd", HTTP_POST, handleCmd);
   web.on("/api/wifi", HTTP_POST, handleWifi);
-  web.on("/api/wifien", HTTP_POST, handleWifiEn);
+  web.on("/api/wifimode", HTTP_POST, handleWifiMode);
   web.onNotFound(handleNotFound);
   static const char* keys[] = {"X-G3"};
   web.collectHeaders(keys, 1);
@@ -724,6 +740,22 @@ void g3web_poll() {
   }
   if (now - last_check < 2000) return;
   last_check = now;
+#ifdef G3WEB_ETH_PROBE
+  if (wifi_mode == 2 && wifi_pending < 0) {
+    // Automatico: cavo con IP stabile per 10 s = Wi-Fi spento; cavo assente per 5 s = Wi-Fi acceso.
+    bool cable = ethHasIp();
+    if (wifi_on == cable) {                       // c'e' un cambio da fare: conta da quando dura
+      if (auto_since == 0) auto_since = now ? now : 1;
+      if (now - auto_since >= (cable ? 10000u : 5000u)) {
+        Serial.println(cable ? "[G3Web] Cavo attivo: Wi-Fi spento" : "[G3Web] Cavo scollegato: Wi-Fi acceso");
+        applyWifi(!cable);
+        auto_since = 0;
+      }
+    } else {
+      auto_since = 0;
+    }
+  }
+#endif
   if (!wifi_on) return;                // Wi-Fi spento: niente controlli di rete
 
   if (WiFi.status() == WL_CONNECTED) {
