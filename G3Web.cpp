@@ -22,7 +22,6 @@
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "lwip/netif.h"
-#include "lwip/netifapi.h"
 #include "lwip/tcpip.h"
 #include "lwip/dhcp.h"
 #include "lwip/etharp.h"
@@ -162,6 +161,11 @@ err_t ethNetifInit(struct netif* n) {
   return ERR_OK;
 }
 
+// Operazioni su lwIP: eseguite nel thread di rete tramite tcpip_callback (stesso ordine di invio).
+enum { OP_ADD = 1, OP_LINK_UP, OP_LINK_DOWN, OP_DEFAULT };
+void ethNetOp(void* a);
+void ethCall(int op) { tcpip_callback(ethNetOp, (void*)(intptr_t)op); }
+
 // Legge un pacchetto dalla memoria del chip; true se ne ha consumato uno.
 bool ethRxOne() {
   ethRead(R_MRCMDX);                        // lettura a vuoto: aggiorna lo stato di pronto
@@ -186,6 +190,28 @@ bool ethRxOne() {
   return true;
 }
 
+void ethNetOp(void* a) {
+  ip4_addr_t z; ip4_addr_set_zero(&z);
+  switch ((intptr_t)a) {
+    case OP_ADD:
+      netif_add(&eth_if, &z, &z, &z, nullptr, ethNetifInit, tcpip_input);
+      netif_set_up(&eth_if);
+      break;
+    case OP_LINK_UP:
+      netif_set_link_up(&eth_if);
+      dhcp_start(&eth_if);
+      break;
+    case OP_LINK_DOWN:
+      dhcp_stop(&eth_if);
+      netif_set_addr(&eth_if, &z, &z, &z);
+      netif_set_link_down(&eth_if);
+      break;
+    case OP_DEFAULT:
+      if (!netif_default) netif_set_default(&eth_if);
+      break;
+  }
+}
+
 bool ethHasIp() { return eth_link && !ip4_addr_isany_val(*netif_ip4_addr(&eth_if)); }
 
 void ethTask(void*) {
@@ -203,16 +229,12 @@ void ethTask(void*) {
           xSemaphoreGive(eth_mtx);
           if (l) {
             Serial.println("[G3Web] Ethernet: cavo collegato");
-            netifapi_netif_set_link_up(&eth_if);
-            netifapi_dhcp_start(&eth_if);
+            ethCall(OP_LINK_UP);
             eth_dhcp = true;
           } else {
             Serial.println("[G3Web] Ethernet: cavo scollegato");
-            netifapi_dhcp_stop(&eth_if);
+            ethCall(OP_LINK_DOWN);
             eth_dhcp = false;
-            ip4_addr_t z; ip4_addr_set_zero(&z);
-            netifapi_netif_set_addr(&eth_if, &z, &z, &z);
-            netifapi_netif_set_link_down(&eth_if);
             eth_ip_logged = false;
           }
           xSemaphoreTake(eth_mtx, portMAX_DELAY);
@@ -226,7 +248,7 @@ void ethTask(void*) {
     }
     if (eth_link && !eth_ip_logged && !ip4_addr_isany_val(*netif_ip4_addr(&eth_if))) {
       eth_ip_logged = true;
-      if (!netif_default) netifapi_netif_set_default(&eth_if);
+      ethCall(OP_DEFAULT);
       Serial.printf("[G3Web] Ethernet: http://%s/\n", ip4addr_ntoa(netif_ip4_addr(&eth_if)));
     }
     vTaskDelay(pdMS_TO_TICKS(eth_link ? 2 : 100));
@@ -248,9 +270,7 @@ void ethStart() {
   Serial.printf("[G3Web] CH390: VID=%04X PID=%04X REV=%02X NSR=%02X\n", eth_vid, eth_pid, eth_rev, eth_nsr);
   if (eth_vid != 0x1C00) return;            // chip assente o non risponde: niente rete cablata
   esp_netif_init();                         // avvia lwIP anche con il Wi-Fi spento
-  ip4_addr_t z; ip4_addr_set_zero(&z);
-  netifapi_netif_add(&eth_if, &z, &z, &z, nullptr, ethNetifInit, tcpip_input);
-  netifapi_netif_set_up(&eth_if);
+  ethCall(OP_ADD);
   eth_ready = true;
   xTaskCreatePinnedToCore(ethTask, "g3eth", 4096, nullptr, 3, nullptr, 0);
 }
