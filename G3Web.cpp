@@ -55,6 +55,7 @@ SPIClass ethSPI(FSPI);                    // la radio LoRa usa gia' HSPI (SPI3):
 SemaphoreHandle_t eth_mtx = nullptr;
 esp_netif_t* eth_nif = nullptr;
 uint16_t eth_vid = 0, eth_pid = 0;
+uint16_t eth_p0 = 0, eth_p4 = 0, eth_p5 = 0;
 uint8_t eth_rev = 0, eth_nsr = 0, eth_ncr = 0;
 bool eth_ready = false, eth_link = false, eth_dhcp = false, eth_ip_logged = false;
 uint32_t eth_flaps = 0, eth_rx = 0, eth_tx = 0, eth_rxerr = 0, eth_txerr = 0, eth_resets = 0;
@@ -81,6 +82,25 @@ void ethWrite(uint8_t reg, uint8_t v) {
   ethSPI.transfer(0x80 | reg);              // bit 7 = 1: scrittura
   ethSPI.transfer(v);
   csHigh();
+}
+
+uint16_t ethPhyRead(uint8_t reg) {            // registro del PHY interno (indirizzo 1)
+  ethWrite(0x0C, 0x40 | reg);
+  ethWrite(0x0B, 0x0C);
+  uint32_t t0 = millis();
+  while ((ethRead(0x0B) & 0x01) && millis() - t0 < 5) {}
+  ethWrite(0x0B, 0x00);
+  return ethRead(0x0D) | (ethRead(0x0E) << 8);
+}
+
+void ethPhyWrite(uint8_t reg, uint16_t v) {
+  ethWrite(0x0C, 0x40 | reg);
+  ethWrite(0x0D, v & 0xFF);
+  ethWrite(0x0E, v >> 8);
+  ethWrite(0x0B, 0x0A);
+  uint32_t t0 = millis();
+  while ((ethRead(0x0B) & 0x01) && millis() - t0 < 5) {}
+  ethWrite(0x0B, 0x00);
 }
 
 void ethRxReset() {                         // ripristino del motore di ricezione dopo un errore
@@ -114,6 +134,8 @@ void ethHwInit() {
   ethWrite(R_ISR, 0x3F);
   ethWrite(R_IMR, 0x80);                    // puntatore memoria circolare (niente interrupt: si legge a polling)
   ethWrite(R_RCR, 0x31);                    // RX on, scarta CRC e pacchetti lunghi
+  ethPhyWrite(4, 0x01E1);                   // annuncia 10/100 half/full e riavvia l'auto-negoziazione
+  ethPhyWrite(0, 0x1200);
 }
 
 
@@ -195,6 +217,7 @@ void ethTask(void*) {
         last_link = now;
         eth_nsr = ethRead(R_NSR);
         eth_ncr = ethRead(R_NCR);
+        eth_p0 = ethPhyRead(0); eth_p4 = ethPhyRead(4); eth_p5 = ethPhyRead(5);
         bool l = (eth_nsr & 0x40) != 0;
         static uint8_t down_cnt = 0;
         if (l) down_cnt = 0;
@@ -362,7 +385,7 @@ let WM=1,REP=true,ETHOK=false;
 async function rep(){await run('set repeat '+(REP?'off':'on'));refresh()}
 async function wm(){const v=+$('f_wm').value;if(v===0&&!ETHOK&&!confirm('Il cavo di rete non risulta collegato con un indirizzo IP: spegnendo il Wi-Fi non potrai più aprire questa pagina. Per riattivarlo tieni premuto il pulsante di reset per 5 secondi. Continuare?')){$('f_wm').value=WM;return}if(v===0&&ETHOK&&!confirm('Spegnere il Wi-Fi? La pagina resterà raggiungibile dal cavo di rete.')){$('f_wm').value=WM;return}try{const r=await post('/api/wifimode','m='+v);if(r!==null){msg(r);WM=v}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
 function ethTxt(e){if(e.vid!==0x1c00)return 'chip non rilevato';if(!e.ready)return 'errore di avvio';
-if(!e.link)return 'cavo scollegato - NSR '+e.nsr.toString(16)+' cambi link '+e.fl+' reset '+e.rs;return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+' - rx '+e.rx+' tx '+e.tx+' err '+e.err+' (tx '+e.txe+') reset '+e.rs+' - NSR '+e.nsr.toString(16)+' cambi link '+e.fl}
+if(!e.link)return 'cavo scollegato - NSR '+e.nsr.toString(16)+' cambi link '+e.fl+' reset '+e.rs;return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+' - rx '+e.rx+' tx '+e.tx+' err '+e.err+' (tx '+e.txe+') reset '+e.rs+' - NSR '+e.nsr.toString(16)+' cambi link '+e.fl+' - PHY BMCR '+e.p0.toString(16)+' ANAR '+e.p4.toString(16)+' partner '+e.p5.toString(16)}
 function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' g ':'')+h+' h '+m+' min'}
 const HMAX=360,HI={t:[],noise:[],rssi:[],snr:[],rx:[],tx:[]};let prevC=null;
 function hpush(k,v){const a=HI[k];a.push(v);if(a.length>HMAX)a.shift()}
@@ -534,6 +557,9 @@ void handleStatus() {
   o += ",\"tx\":"; o += eth_tx;
   o += ",\"err\":"; o += (uint32_t)(eth_rxerr + eth_txerr);
   o += ",\"nsr\":"; o += (uint32_t)eth_nsr;
+  o += ",\"p0\":"; o += (uint32_t)eth_p0;
+  o += ",\"p4\":"; o += (uint32_t)eth_p4;
+  o += ",\"p5\":"; o += (uint32_t)eth_p5;
   o += ",\"fl\":"; o += eth_flaps;
   o += ",\"rs\":"; o += eth_resets;
   o += ",\"txe\":"; o += eth_txerr;
