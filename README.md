@@ -10,6 +10,7 @@ The G3 hardware variant is not yet in MeshCore's main branch: it comes from pull
 
 - **Coding rate 8** come predefinito (preset EU/UK Narrow 869.618 MHz, SF8, BW 62.5, CR8). / **Coding rate 8** as default (EU/UK Narrow preset).
 - **LED:** il LED blu (LoRa) si accende quando il nodo trasmette, il LED LINK quando riceve un pacchetto. / **LEDs:** the blue (LoRa) LED lights up on transmit, the LINK LED on receive.
+- **Risparmio energetico disattivato** sul G3 (alimentato dalla rete): il nodo resta sempre acceso. Con l'interfaccia web attiva lo è anche sulla Heltec V3, perché lo sleep spegnerebbe il Wi-Fi. / **Power saving disabled** on the G3 (mains powered): the node stays always on. With the web interface on, the same applies to the Heltec V3, since sleep would switch Wi-Fi off.
 - **Interfaccia web** (opzionale, vedi sotto) per stato e configurazione. / **Web interface** (optional, see below) for status and configuration.
 
 ## Attenzione: password / Warning: password
@@ -69,13 +70,26 @@ Inclusa se `web_ui` è attivo. Si usa solo in **HTTP sulla rete locale**: non es
 1. Collegati alla rete Wi-Fi aperta **`Repeater-setup`** e apri `http://192.168.4.1/`. / Join the open Wi-Fi **`Repeater-setup`** and open `http://192.168.4.1/`.
 2. Accedi con utente **`admin`** e la password admin del repeater. / Log in as **`admin`** with the repeater admin password.
 3. Nella sezione *Wi-Fi* inserisci la tua rete e premi *Salva e riavvia*. / In the *Wi-Fi* section enter your network and press *Salva e riavvia*.
-4. Poi la pagina è su `http://meshcore-repeater.local/` o all'IP assegnato dal router. / Then the page is at `http://meshcore-repeater.local/` or the IP your router assigned.
+4. Poi la pagina è su `http://meshcore-repeater.local/` (solo Wi-Fi) o all'IP assegnato dal router. / Then the page is at `http://meshcore-repeater.local/` (Wi-Fi only) or the IP your router assigned.
 
 **Cosa si può fare / Features**
-- Stato: nome, versione, orologio, radio, potenza, posizione, Wi-Fi, memoria, statistiche e vicini. / Status: name, version, clock, radio, power, position, Wi-Fi, memory, stats and neighbors.
+- Stato: nome, versione, orologio, radio, potenza, ripetizione, posizione, Wi-Fi, Ethernet, memoria, statistiche e vicini, con **grafici in tempo reale** (rumore di fondo, RSSI, SNR, pacchetti). I grafici non vengono salvati: ripartono a ogni apertura della pagina. / Status: name, version, clock, radio, power, repeat mode, position, Wi-Fi, Ethernet, memory, stats and neighbors, with **live charts** (noise floor, RSSI, SNR, packets). Charts are not stored: they restart each time the page is opened.
+- **Ripetizione on/off:** il pulsante *Disattiva/Attiva ripetizione* spegne l'inoltro dei messaggi; il nodo resta attivo, ma non ripete (equivale a `set repeat off`). / **Repeat on/off:** the *Disattiva/Attiva ripetizione* button turns message forwarding off; the node stays up but does not repeat (same as `set repeat off`).
 - Configurazione: nome, **radio con menu a tendina** (preset delle regioni come nell'app, frequenza, larghezza di banda, SF, CR, dimensione hash del percorso 1/2/3 byte), potenza TX, posizione, password admin, advert, sincronizzazione dell'ora, riavvio. / Configuration: name, **radio with drop-down menus** (regional presets as in the app, frequency, bandwidth, SF, CR, path hash size 1/2/3 bytes), TX power, position, admin password, advert, clock sync, reboot.
 - Console per gli altri comandi (alcuni, come la chiave privata, restano solo da seriale). / Console for other commands (some, like the private key, stay serial-only).
 - I parametri radio si applicano dopo il riavvio. / Radio settings apply after a reboot.
+
+**Rete cablata (Ethernet), solo ThinkNode G3 / Wired network (Ethernet), ThinkNode G3 only**
+- Il G3 ha un chip Ethernet (CH390) sul connettore RJ45: collega il cavo e il nodo prende un indirizzo con il DHCP. Il led verde del connettore indica 100 Mbps. / The G3 has an Ethernet chip (CH390) on the RJ45 jack: plug the cable and the node gets an address via DHCP. The green LED on the jack means 100 Mbps.
+- L'indirizzo si legge nella riga *Ethernet* della pagina, nel router o sulla seriale (`[G3Web] Ethernet: http://...`). Sul cavo il nome `meshcore-repeater.local` non è disponibile: usa l'IP. / Read the address from the *Ethernet* row, from your router or from the serial console (`[G3Web] Ethernet: http://...`). `meshcore-repeater.local` is not available over the cable: use the IP.
+- Con il cavo attivo non compare più la rete `Repeater-setup`. / With the cable active the `Repeater-setup` network no longer appears.
+
+**Modo Wi-Fi / Wi-Fi mode**
+Nella sezione *Wi-Fi* il menu offre: / The *Wi-Fi* section has a menu with:
+- **Sempre acceso / Always on**
+- **Sempre spento / Always off**: la pagina resta raggiungibile solo dal cavo (sul G3). Per riattivare il Wi-Fi: reset da 5 secondi. / the page is reachable only over the cable (G3). To bring Wi-Fi back: 5-second reset.
+- **Automatico / Automatic** (solo G3 / G3 only): il Wi-Fi si spegne circa 10 s dopo che il cavo ha un IP e si riaccende circa 5 s dopo che lo scolleghi. / Wi-Fi turns off about 10 s after the cable gets an IP and comes back about 5 s after you unplug it.
+La scelta resta salvata dopo il riavvio. / The choice is kept across reboots.
 
 **Reset del Wi-Fi / Wi-Fi reset**
 - Tieni premuto **Reload** (sull'Heltec V3: **PRG**) per **5 secondi**: il nodo cancella il Wi-Fi salvato e ricrea `Repeater-setup`. / Hold **Reload** (on the Heltec V3: **PRG**) for **5 seconds**: the node clears the saved Wi-Fi and brings `Repeater-setup` back.
