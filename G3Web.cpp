@@ -152,6 +152,9 @@ pre{white-space:pre-wrap;word-break:break-all;background:#0f141b;padding:8px;bor
 <div class="r"><select id="f_hm"></select></div>
 <div class="r"><button onclick="rad()">Salva radio</button></div>
 <small>Tutti i nodi della stessa rete devono usare gli stessi valori. Dopo il salvataggio serve un riavvio.</small>
+<label>Modalità ripetitore</label>
+<div class="r"><button class="s" id="b_rep" onclick="rep()">Disattiva ripetizione</button></div>
+<small>Spento, il nodo non ripete i messaggi degli altri ma funziona e si configura come sempre.</small>
 <label>Potenza TX (dBm)</label>
 <div class="r"><input id="f_tx" type="number" min="1" max="22" placeholder="Potenza TX (dBm)"><button onclick="sv('set tx ','f_tx')">Salva TX</button></div>
 <label>Posizione</label>
@@ -188,7 +191,8 @@ function pre(){const k=+$('f_preset').value;if(k<0)return;const x=PRE[k];setRadi
 async function rad(){const f=parseFloat($('f_freq').value);if(!(f>=150&&f<=2500))return msg('Frequenza non valida',1);await run('set path.hash.mode '+$('f_hm').value);run('set radio '+f+','+$('f_bw').value+','+$('f_sf').value+','+$('f_cr').value,' - riavvia per applicare')}
 function go(){const v=$('f_cmd').value.trim();if(v)run(v)}
 async function wf(){const s=$('f_ssid').value.trim(),p=$('f_wpw').value;if(!s)return msg('SSID vuoto',1);if(p&&p.length<8)return msg('La password Wi-Fi deve avere almeno 8 caratteri',1);if(!confirm('Salvare il Wi-Fi e riavviare?'))return;try{const r=await post('/api/wifi','ssid='+encodeURIComponent(s)+'&pwd='+encodeURIComponent(p));if(r!==null)msg(r)}catch(e){msg('Riavvio in corso')}}
-let WEN=true;
+let WEN=true,REP=true;
+async function rep(){await run('set repeat '+(REP?'off':'on'));refresh()}
 async function wen(){const msgt=WEN?'Disattivare il Wi-Fi? La pagina sarà raggiungibile solo dalla rete cablata. Se non hai la LAN attiva non potrai più aprirla: per riattivare il Wi-Fi tieni premuto il pulsante di reset per 5 secondi.':'Riattivare il Wi-Fi?';if(!confirm(msgt))return;try{const r=await post('/api/wifien','en='+(WEN?0:1));if(r!==null){msg(r);WEN=!WEN;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi'}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
 function hx(v,n){return v.toString(16).toUpperCase().padStart(n,'0')}
 function ethTxt(e){if(e.vid===0||e.vid===0xffff)return 'nessuna risposta dal chip (ID '+hx(e.vid,4)+':'+hx(e.pid,4)+', NSR '+hx(e.nsr,2)+')';
@@ -233,11 +237,11 @@ hpush('t',now);hpush('noise',Rr.noise_floor==null?null:Rr.noise_floor);hpush('rs
 function charts(){chart('ch1',[{n:'Rumore di fondo',k:'noise',c:'#4da3ff'},{n:'Ultimo RSSI',k:'rssi',c:'#f6ad55',dash:1}],{u:' dBm',dec:0});chart('ch2',[{n:'SNR',k:'snr',c:'#68d391'}],{u:' dB',dec:1});chart('ch3',[{n:'Ricevuti',k:'rx',c:'#4da3ff'},{n:'Inviati',k:'tx',c:'#f6ad55',dash:1}],{u:'/min',dec:1,zero:1})}
 let first=true;
 async function refresh(){try{const r=await fetch('/api/status');if(r.status==401){location.reload();return}const s=await r.json(),w=s.wifi;
-const rows=[['Nome',s.name],['Versione',s.ver],['Orologio (UTC)',s.clock],['Radio',s.radio],['Potenza TX',s.tx],['Hash percorso',isNaN(+s.hm)||s.hm===''?'?':(+s.hm+1)+' byte'],['Posizione',s.lat+', '+s.lon],['Wi-Fi',s.wen===false?'disattivato':w.ssid?(w.ssid+' - '+w.ip+' - '+w.rssi+' dBm'):(w.ap?'modalità setup (rete '+s.apname+')':'non connesso')],['Memoria libera',Math.round(s.heap/1024)+' kB'],['Attivo da',fmt(s.up)]];
+const rows=[['Nome',s.name],['Versione',s.ver],['Orologio (UTC)',s.clock],['Radio',s.radio],['Potenza TX',s.tx],['Ripetizione',s.rep==='off'?'disattivata':'attiva'],['Hash percorso',isNaN(+s.hm)||s.hm===''?'?':(+s.hm+1)+' byte'],['Posizione',s.lat+', '+s.lon],['Wi-Fi',s.wen===false?'disattivato':w.ssid?(w.ssid+' - '+w.ip+' - '+w.rssi+' dBm'):(w.ap?'modalità setup (rete '+s.apname+')':'non connesso')],['Memoria libera',Math.round(s.heap/1024)+' kB'],['Attivo da',fmt(s.up)]];
 if(s.eth)rows.push(['Ethernet (prova)',ethTxt(s.eth)]);
 const t=$('t');t.textContent='';rows.forEach(a=>{const tr=document.createElement('tr');a.forEach(x=>{const td=document.createElement('td');td.textContent=x;tr.appendChild(td)});t.appendChild(tr)});
 $('core').textContent=s.core;$('rs').textContent=s.rs;$('pk').textContent=s.pk;$('nb').textContent=s.nb||'(nessuno)';
-WEN=s.wen!==false;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi';$('hd').textContent=s.name+' \u00b7 MeshCore Repeater';document.title=s.name;$('rst').textContent='Se cambi rete o sbagli, tieni premuto il pulsante '+s.btn+' per 5 secondi: il nodo cancella il Wi-Fi e crea la rete "'+s.apname+'" (pagina su 192.168.4.1). Se la rete salvata non risponde per 45 secondi, la crea da solo.';
+REP=s.rep!=='off';$('b_rep').textContent=REP?'Disattiva ripetizione':'Attiva ripetizione';WEN=s.wen!==false;$('b_wen').textContent=WEN?'Disattiva Wi-Fi':'Attiva Wi-Fi';$('hd').textContent=s.name+' \u00b7 MeshCore Repeater';document.title=s.name;$('rst').textContent='Se cambi rete o sbagli, tieni premuto il pulsante '+s.btn+' per 5 secondi: il nodo cancella il Wi-Fi e crea la rete "'+s.apname+'" (pagina su 192.168.4.1). Se la rete salvata non risponde per 45 secondi, la crea da solo.';
 const C=jp(s.core),Rr=jp(s.rs),P=jp(s.pk);cards(C,Rr,P,s.up);sample(Rr,P);charts();
 if(first){first=false;$('f_name').value=s.name;{const q=s.radio.split(',');if(q.length==4)setRadio(+q[0],+q[1],+q[2],+q[3]);if(s.hm!==''&&!isNaN(+s.hm))$('f_hm').value=+s.hm}$('f_tx').value=s.tx;$('f_lat').value=s.lat;$('f_lon').value=s.lon;$('f_ssid').value=w.cfg||''}
 }catch(e){}}
@@ -348,6 +352,7 @@ void handleStatus() {
   field(o, "radio", "get radio", 1);
   field(o, "tx", "get tx", 1);
   field(o, "hm", "get path.hash.mode", 1);
+  field(o, "rep", "get repeat", 1);
   o += wifi_on ? "\"wen\":true," : "\"wen\":false,";
 #ifdef G3WEB_ETH_PROBE
   o += "\"eth\":{\"vid\":"; o += (uint32_t)eth_vid;
