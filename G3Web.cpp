@@ -282,6 +282,11 @@ void ethStart() {
 
 Preferences g3prefs;
 
+// Nomi dei nodi vicini: si imparano dagli annunci ricevuti (si perdono al riavvio).
+struct NameEnt { uint8_t id[4]; char name[32]; };
+NameEnt names[24];
+uint8_t names_n = 0, names_next = 0;
+
 G3WebPasswordFn getPassword = nullptr;
 G3WebExecFn execCmd = nullptr;
 
@@ -310,7 +315,7 @@ header{padding:12px 16px;background:#1b2330;font-weight:600}
 main{max-width:760px;margin:0 auto;padding:8px 12px}
 section{background:#171d26;border-radius:10px;padding:12px 14px;margin:12px 0}
 h2{font-size:15px;margin:0 0 8px;color:#9fb3c8}
-table{width:100%;border-collapse:collapse}td{padding:3px 0;vertical-align:top}td:first-child{color:#9fb3c8;width:38%}
+table{width:100%;border-collapse:collapse}table.nb td{width:auto;color:inherit;padding:4px 6px;border-bottom:1px solid #232c38}table.nb tr:first-child td{color:#9fb3c8;font-size:12px}table.nb td:last-child{text-align:right}td{padding:3px 0;vertical-align:top}td:first-child{color:#9fb3c8;width:38%}
 input,select,button{font:inherit;padding:6px 8px;border-radius:6px;border:1px solid #394456;background:#0f141b;color:inherit}
 button{background:#2b6cb0;border-color:#2b6cb0;cursor:pointer}button.s{background:#2a3342;border-color:#394456}
 .r{display:flex;gap:6px;margin:6px 0;flex-wrap:wrap}.r input{flex:1;min-width:90px}
@@ -327,7 +332,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#0f141b;padding:8px;bor
 <label>Qualità del segnale, SNR (dB)</label><div id="ch2"></div>
 <label>Traffico (pacchetti al minuto)</label><div id="ch3"></div>
 <small>I grafici si costruiscono mentre la pagina è aperta (un campione ogni 10 secondi, ultima ora) e ripartono da zero se la ricarichi. Tocca o passa sopra un grafico per leggere i valori.</small></section>
-<section><h2>Vicini</h2><pre id="nb"></pre></section>
+<section><h2>Vicini</h2><table id="nbt" class="nb"></table><p id="nbn" style="margin:6px 0 0;font-size:12px;color:#9fb3c8"></p></section>
 <section><h2>Configurazione</h2>
 <div class="r"><input id="f_name" placeholder="Nome nodo"><button onclick="sv('set name ','f_name')">Salva nome</button></div>
 <label>Radio</label>
@@ -386,6 +391,13 @@ async function rep(){await run('set repeat '+(REP?'off':'on'));refresh()}
 async function wm(){const v=+$('f_wm').value;if(v===0&&!ETHOK&&!confirm('Il cavo di rete non risulta collegato con un indirizzo IP: spegnendo il Wi-Fi non potrai più aprire questa pagina. Per riattivarlo tieni premuto il pulsante di reset per 5 secondi. Continuare?')){$('f_wm').value=WM;return}if(v===0&&ETHOK&&!confirm('Spegnere il Wi-Fi? La pagina resterà raggiungibile dal cavo di rete.')){$('f_wm').value=WM;return}try{const r=await post('/api/wifimode','m='+v);if(r!==null){msg(r);WM=v}}catch(e){msg('Collegamento interrotto: il Wi-Fi potrebbe essersi spento',1)}}
 function ethTxt(e){if(e.vid!==0x1c00)return 'chip non rilevato';if(!e.ready)return 'errore di avvio';
 if(!e.link)return 'cavo scollegato';return e.spd+' Mbps '+(e.fdx?'full':'half')+' duplex - '+(e.ip&&e.ip!=='0.0.0.0'?e.ip+' (gateway '+e.gw+')':'attesa indirizzo DHCP...')+(e.err?' - errori '+e.err:'')}
+function ago(n){if(!isFinite(n)||n<0||n>315360000)return '?';if(n<60)return n+' s fa';if(n<3600)return Math.floor(n/60)+' min fa';if(n<86400)return Math.floor(n/3600)+' h fa';return Math.floor(n/86400)+' g fa'}
+function snrc(q){const d=q/4;return d.toFixed(1)+' dB'}
+function nbs(v,nm){nm=nm||{};const t=$('nbt'),n=$('nbn');t.textContent='';n.textContent='';const L=(v||'').split('\n').map(x=>x.trim()).filter(x=>x&&x!=='-none-');
+if(!L.length){n.textContent='Nessun vicino sentito.';return}
+const h=document.createElement('tr');['Nodo','Ultimo segnale','SNR'].forEach(x=>{const td=document.createElement('td');td.textContent=x;h.appendChild(td)});t.appendChild(h);let bad=false;
+L.forEach(l=>{const p=l.split(':');const tr=document.createElement('tr');const secs=+p[1];if(!isFinite(secs)||secs<0||secs>315360000)bad=true;[nm[p[0].toUpperCase()]?nm[p[0].toUpperCase()]+' ('+p[0]+')':p[0],ago(secs),isFinite(+p[2])?snrc(+p[2]):'?'].forEach(x=>{const td=document.createElement('td');td.textContent=x;tr.appendChild(td)});t.appendChild(tr)});
+if(bad)n.textContent='Il tempo non è attendibile: l\'orologio del nodo non è sincronizzato (usa «Sincronizza ora»).'}
 function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' g ':'')+h+' h '+m+' min'}
 const HMAX=360,HI={t:[],noise:[],rssi:[],snr:[],rx:[],tx:[]};let prevC=null;
 function hpush(k,v){const a=HI[k];a.push(v);if(a.length>HMAX)a.shift()}
@@ -429,7 +441,7 @@ async function refresh(){try{const r=await fetch('/api/status');if(r.status==401
 const rows=[['Nome',s.name],['Versione',s.ver],['Orologio (UTC)',s.clock],['Radio',s.radio],['Potenza TX',s.tx],['Ripetizione',s.rep==='off'?'disattivata':'attiva'],['Hash percorso',isNaN(+s.hm)||s.hm===''?'?':(+s.hm+1)+' byte'],['Posizione',s.lat+', '+s.lon],['Wi-Fi',s.wen===false?(s.wm===2?'spento automaticamente (cavo di rete attivo)':'disattivato'):w.ssid?(w.ssid+' - '+w.ip+' - '+w.rssi+' dBm'):(w.ap?'modalità setup (rete '+s.apname+')':'non connesso')],['Memoria libera',Math.round(s.heap/1024)+' kB'],['Attivo da',fmt(s.up)]];
 if(s.eth)rows.push(['Ethernet',ethTxt(s.eth)]);
 const t=$('t');t.textContent='';rows.forEach(a=>{const tr=document.createElement('tr');a.forEach(x=>{const td=document.createElement('td');td.textContent=x;tr.appendChild(td)});t.appendChild(tr)});
-$('core').textContent=s.core;$('rs').textContent=s.rs;$('pk').textContent=s.pk;$('nb').textContent=s.nb||'(nessuno)';
+$('core').textContent=s.core;$('rs').textContent=s.rs;$('pk').textContent=s.pk;nbs(s.nb,s.names);
 REP=s.rep!=='off';$('b_rep').textContent=REP?'Disattiva ripetizione':'Attiva ripetizione';WM=s.wm;ETHOK=!!(s.eth&&s.eth.link&&s.eth.ip&&s.eth.ip!=='0.0.0.0');if(document.activeElement!==$('f_wm'))$('f_wm').value=s.wm;if(!s.eth){const o=$('o_auto');if(o)o.remove()}$('hd').textContent=s.name+' \u00b7 MeshCore Repeater';document.title=s.name;$('rst').textContent='Se cambi rete o sbagli, tieni premuto il pulsante '+s.btn+' per 5 secondi: il nodo cancella il Wi-Fi e crea la rete "'+s.apname+'" (pagina su 192.168.4.1). Se la rete salvata non risponde per 45 secondi, la crea da solo.';
 const C=jp(s.core),Rr=jp(s.rs),P=jp(s.pk);cards(C,Rr,P,s.up);sample(Rr,P);charts();
 if(first){first=false;$('f_name').value=s.name;{const q=s.radio.split(',');if(q.length==4)setRadio(+q[0],+q[1],+q[2],+q[3]);if(s.hm!==''&&!isNaN(+s.hm))$('f_hm').value=+s.hm}$('f_tx').value=s.tx;$('f_lat').value=s.lat;$('f_lon').value=s.lon;$('f_ssid').value=w.cfg||''}
@@ -572,6 +584,14 @@ void handleStatus() {
   field(o, "rs", "stats-radio", 0);
   field(o, "pk", "stats-packets", 0);
   field(o, "nb", "neighbors", 1);
+  o += "\"names\":{";
+  for (uint8_t i = 0; i < names_n; i++) {
+    char k[9];
+    for (int j = 0; j < 4; j++) snprintf(k + j * 2, 3, "%02X", names[i].id[j]);
+    if (i) o += ',';
+    jesc(o, k); o += ':'; jesc(o, names[i].name);
+  }
+  o += "},";
 
   bool up = (WiFi.status() == WL_CONNECTED);
   o += "\"wifi\":{\"ssid\":";
@@ -693,6 +713,20 @@ void handleNotFound() {
 }  // namespace
 
 // ---- API pubblica ---------------------------------------------------------
+
+void g3web_note_name(const uint8_t* pubkey, const char* name) {
+  if (!pubkey || !name || !name[0]) return;
+  uint8_t i = 0;
+  while (i < names_n && memcmp(names[i].id, pubkey, 4) != 0) i++;
+  if (i == names_n) {                       // nuovo nodo: usa il primo posto libero, poi sostituisce il piu' vecchio
+    if (names_n < 24) names_n++;
+    else { i = names_next; names_next = (names_next + 1) % 24; }
+    if (i >= names_n) i = names_n - 1;
+  }
+  memcpy(names[i].id, pubkey, 4);
+  strncpy(names[i].name, name, sizeof(names[i].name) - 1);
+  names[i].name[sizeof(names[i].name) - 1] = 0;
+}
 
 void g3web_start(G3WebPasswordFn password, G3WebExecFn exec) {
   getPassword = password;
