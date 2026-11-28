@@ -161,6 +161,16 @@ jobs:
               assert s.count(a3) == 1, "the_mesh.loop non trovato"
               s = s.replace(a3, '  g3web_poll();\n' + a3)
               open(m, 'w').write(s)
+              # nomi dei vicini: ad ogni annuncio ripetitore ricevuto il nome viene passato alla pagina web
+              m = 'examples/simple_repeater/MyMesh.cpp'
+              s = open(m).read()
+              b1 = '#include "MyMesh.h"\n'
+              assert s.count(b1) == 1, "include MyMesh.h (MyMesh.cpp) non trovato"
+              s = s.replace(b1, b1 + '#include "G3Web.h"\n')
+              b2 = 'putNeighbour(id, timestamp, packet->getSNR());\n'
+              assert s.count(b2) == 1, "putNeighbour non trovato"
+              s = s.replace(b2, b2 + '      g3web_note_name(id.pub_key, parser.getName());\n')
+              open(m, 'w').write(s)
 
           # G3 (alimentato dalla rete): risparmio energetico sempre disattivato
           if BOARD != 'Heltec V3':
