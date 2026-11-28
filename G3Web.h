@@ -15,3 +15,5 @@ typedef void (*G3WebExecFn)(uint32_t sender_timestamp, char* command, char* repl
 
 void g3web_start(G3WebPasswordFn password, G3WebExecFn exec);
 void g3web_poll();
+// Memorizza il nome di un nodo (primi 4 byte della chiave pubblica) per mostrarlo tra i vicini.
+void g3web_note_name(const uint8_t* pubkey, const char* name);
